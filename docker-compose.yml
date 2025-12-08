@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: flora-postgres
+    environment:
+      - POSTGRES_USER=flora
+      - POSTGRES_PASSWORD=flora
+      - POSTGRES_DB=flora
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flora"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - flora-pgdata:/var/lib/postgresql/data
+    networks:
+      - flora-net
+
+  flora-consumer:
+    build:
+      context: .
+      dockerfile: docker/flora-consumer.Dockerfile
+    container_name: flora-consumer
+    env_file:
+      - ./config/consumer.env
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - flora-net
+
+  petal-1:
+    build:
+      context: .
+      dockerfile: docker/petal.Dockerfile
+    container_name: petal-1
+    env_file:
+      - ./config/petal-1.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flora-consumer:
+        condition: service_healthy
+    networks:
+      - flora-net
+
+  petal-2:
+    build:
+      context: .
+      dockerfile: docker/petal.Dockerfile
+    container_name: petal-2
+    env_file:
+      - ./config/petal-2.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flora-consumer:
+        condition: service_healthy
+    networks:
+      - flora-net
+
+  petal-3:
+    build:
+      context: .
+      dockerfile: docker/petal.Dockerfile
+    container_name: petal-3
+    env_file:
+      - ./config/petal-3.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flora-consumer:
+        condition: service_healthy
+    networks:
+      - flora-net
+
+  flora-dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard.dev.Dockerfile
+    container_name: flora-dashboard
+    working_dir: /workspace
+    command: >-
+      sh -c "if [ ! -f node_modules/.modules.yaml ]; then pnpm install --no-frozen-lockfile; fi && pnpm run dev"
+    environment:
+      - NEXT_PUBLIC_FLORA_API_BASE=http://flora-consumer:3000
+      - HOST=0.0.0.0
+      - PORT=3101
+    ports:
+      - "3101:3101"
+    volumes:
+      - ./dashboard:/workspace
+      - dashboard-dev-node_modules:/workspace/node_modules
+      - dashboard-dev-pnpm-store:/root/.local/share/pnpm
+    depends_on:
+      flora-consumer:
+        condition: service_healthy
+    networks:
+      - flora-net
+
+  flora-dashboard-prod:
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    container_name: flora-dashboard-prod
+    environment:
+      - NEXT_PUBLIC_FLORA_API_BASE=http://localhost:3000
+    ports:
+      - "3100:3100"
+    depends_on:
+      flora-consumer:
+        condition: service_healthy
+    profiles:
+      - prod
+    networks:
+      - flora-net
+
+networks:
+  flora-net:
+    driver: bridge
+
+volumes:
+  flora-pgdata:
+  dashboard-dev-node_modules:
+  dashboard-dev-pnpm-store:

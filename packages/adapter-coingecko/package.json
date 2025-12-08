@@ -1,0 +1,40 @@
+{
+  "name": "@hol-org/adapter-coingecko",
+  "version": "0.1.2",
+  "description": "HOL Flora adapter for HBAR-USD pricing via Coingecko API (HCS-21 compliant).",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "exports": {
+    ".": "./dist/index.cjs"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/index.cjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  },
+  "license": "Apache-2.0",
+  "author": "Hashgraph Online <hello@hol.org>",
+  "homepage": "https://github.com/hashgraph-online/flora-price-oracle#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hashgraph-online/flora-price-oracle.git",
+    "directory": "packages/adapter-coingecko"
+  },
+  "bugs": {
+    "url": "https://github.com/hashgraph-online/flora-price-oracle/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "hol",
+    "hedera",
+    "flora",
+    "hcs-21",
+    "adapter",
+    "price",
+    "coingecko"
+  ]
+}

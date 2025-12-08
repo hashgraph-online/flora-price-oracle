@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+*.log
+docker/.env.*
+dashboard/.next
+dashboard/.pnpm
+.pnpm
+*.tgz

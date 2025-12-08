@@ -1,0 +1,10 @@
+node_modules
+dashboard/node_modules
+dist
+.git
+.env
+npm-debug.log*
+pnpm-debug.log*
+Dockerfile
+docker-compose.yml
+.DS_Store
