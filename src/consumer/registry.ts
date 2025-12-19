@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import fetch from 'node-fetch';
-import { HCS21Client } from '@hashgraphonline/standards-sdk';
+import { HCS21Client, Logger, type AdapterDeclaration } from '@hashgraphonline/standards-sdk';
 import { getState, setState } from './persistence.js';
 
 type AdapterManifestSpec = {
@@ -27,6 +27,8 @@ const adapterManifests: AdapterManifestSpec[] = [
     packageName: '@hol-org/adapter-hedera-rate',
   },
 ];
+
+const logger = Logger.getInstance({ module: 'flora-consumer' });
 
 export type ResolvedAdapterManifest = {
   adapterId: string;
@@ -114,13 +116,12 @@ const fetchPackageIntegrity = async (
   }
   const tarballUrl = meta.versions[version].dist?.tarball as string;
   const res = await fetch(tarballUrl);
-  if (!res.ok || !res.body) {
+  if (!res.ok) {
     throw new Error(`Failed to download tarball for ${packageName}@${version}`);
   }
   const hash = createHash('sha384');
-  for await (const chunk of res.body as any) {
-    hash.update(chunk);
-  }
+  const data = await res.arrayBuffer();
+  hash.update(Buffer.from(data));
   return { version, integrity: hash.digest('hex') };
 };
 
@@ -342,8 +343,7 @@ export const resolveManifestPointers = async (
         return await attemptInscription();
       } catch (error) {
         lastError = error;
-        // eslint-disable-next-line no-console
-        console.warn(`[manifest] inscription attempt ${i + 1} failed`, error);
+        logger.warn(`[manifest] inscription attempt ${i + 1} failed`, error);
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
@@ -398,19 +398,18 @@ export const publishDeclarations = async (
 ) => {
   const { floraAccount, threshold, stateTopic, coordinationTopic, transactionTopic } = params;
   if (!floraAccount || !stateTopic || !coordinationTopic || !transactionTopic) {
-    throw new Error('HEDERA_ACCOUNT_ID and topic IDs are required to publish adapter declarations');
+    throw new Error('Flora account ID and topic IDs are required to publish adapter declarations');
   }
 
   for (const manifest of manifestPointers) {
     const topics = graph.adapterTopics[manifest.adapterId];
     if (!topics) {
-      // eslint-disable-next-line no-console
-      console.warn(`[registry] missing topics for ${manifest.adapterId}, skipping declaration`);
+      logger.warn(`[registry] missing topics for ${manifest.adapterId}, skipping declaration`);
       continue;
     }
-    const declaration = {
+    const declaration: AdapterDeclaration = {
       p: 'hcs-21',
-      op: 'register' as const,
+      op: 'register',
       adapter_id: manifest.adapterId,
       entity: 'HBAR-USD',
       package: {

@@ -6,13 +6,14 @@ import NavLink from './nav-link';
 import NavDropdown from './nav-dropdown';
 import Logo from './logo';
 import Search from './search';
+import type { Route } from 'next';
 
 type NavItem = {
   type: 'link' | 'dropdown';
   label: string;
-  to?: string;
+  to?: Route;
   href?: string;
-  items?: Array<{ label: string; to?: string; href?: string }>;
+  items?: Array<{ label: string; to?: Route; href?: string }>;
 };
 
 const NAV_ITEMS: NavItem[] = [

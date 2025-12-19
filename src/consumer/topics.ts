@@ -2,6 +2,7 @@ import {
   HCS17Client,
   HCS16Client,
   FloraTopicType,
+  type NetworkType,
 } from '@hashgraphonline/standards-sdk';
 import { getState, setState } from './persistence.js';
 
@@ -10,7 +11,7 @@ const mirrorNodeUrl = process.env.MIRROR_BASE_URL ?? 'https://testnet.mirrornode
 export const resolveFloraTopics = async (
   operatorId: string,
   operatorKey: string,
-  network: string
+  network: NetworkType
 ): Promise<{ stateTopicId: string; coordinationTopicId: string; transactionTopicId: string }> => {
   const persistedStateTopic = await getState('state_topic_id');
   const persistedCoordTopic = await getState('coordination_topic_id');

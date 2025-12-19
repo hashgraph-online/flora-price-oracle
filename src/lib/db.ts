@@ -1,14 +1,24 @@
 import { Pool } from "pg";
-import type { ConsensusEntry } from "../consumer.js";
+import type { ConsensusEntry } from "../consumer/types.js";
 import crypto from "crypto";
+import { Logger } from "@hashgraphonline/standards-sdk";
+
+const logger = Logger.getInstance({ module: "flora-db" });
 
 const pool = new Pool({
-  host: process.env.PGHOST || process.env.POSTGRES_HOST || "postgres",
+  host: process.env.PGHOST || process.env.POSTGRES_HOST || "localhost",
   port: Number(process.env.PGPORT || 5432),
   user: process.env.PGUSER || "flora",
   password: process.env.PGPASSWORD || "flora",
   database: process.env.PGDATABASE || "flora",
 });
+
+pool.on("error", (error: unknown) => {
+  logger.error("Postgres pool error", error);
+});
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
 
 export const initDb = async (): Promise<void> => {
   await pool.query(`
@@ -159,15 +169,32 @@ export const loadConsensusHistory = async (): Promise<ConsensusEntry[]> => {
       ORDER BY epoch ASC;
     `,
   );
-  return res.rows.map((row) => ({
-    epoch: Number(row.epoch),
-    stateHash: row.state_hash,
-    price: Number(row.price),
-    timestamp: row.timestamp,
-    participants: Array.isArray(row.participants) ? row.participants : [],
-    sources: Array.isArray(row.sources) ? row.sources : [],
-    hcsMessage: row.hcs_message ?? undefined,
-    consensusTimestamp: row.consensus_timestamp ?? undefined,
-    sequenceNumber: row.sequence_number ?? undefined,
-  }));
+  const rows = Array.isArray(res.rows) ? res.rows : [];
+  return rows.flatMap((row) => {
+    if (!isRecord(row)) {
+      return [];
+    }
+    const record = row;
+    const stateHash = typeof record.state_hash === "string" ? record.state_hash : undefined;
+    const timestamp = typeof record.timestamp === "string" ? record.timestamp : undefined;
+    if (!stateHash || !timestamp) {
+      return [];
+    }
+    const participants = Array.isArray(record.participants) ? record.participants : [];
+    const sources = Array.isArray(record.sources) ? record.sources : [];
+    return [
+      {
+        epoch: Number(record.epoch ?? 0),
+        stateHash,
+        price: Number(record.price ?? 0),
+        timestamp,
+        participants,
+        sources,
+        hcsMessage: typeof record.hcs_message === "string" ? record.hcs_message : undefined,
+        consensusTimestamp:
+          typeof record.consensus_timestamp === "string" ? record.consensus_timestamp : undefined,
+        sequenceNumber: typeof record.sequence_number === "number" ? record.sequence_number : undefined,
+      },
+    ];
+  });
 };

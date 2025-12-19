@@ -1,13 +1,13 @@
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
-import { HCS21Client, HCS15Client } from '@hashgraphonline/standards-sdk';
+import { HCS21Client, HCS15Client, Logger } from '@hashgraphonline/standards-sdk';
 import {
   initDb,
   saveConsensusEntry,
   loadConsensusHistory,
 } from './lib/db.js';
 import type { ConsumerConfig, ConsumerHandle } from './consumer/types.js';
-import { resolveFloraTopics } from './consumer/topics.js';
+import { resolveFloraNetwork } from './consumer/flora.js';
 import { provisionPetalAccounts } from './consumer/petals.js';
 import {
   ensureRegistryGraph,
@@ -15,6 +15,10 @@ import {
   publishDeclarations,
 } from './consumer/registry.js';
 import { buildConsumer } from './consumer/server.js';
+import { resolveNetwork } from './lib/network.js';
+import { resolveOperatorKeyType, type HederaKeyType } from './lib/operator-key-type.js';
+
+const logger = Logger.getInstance({ module: 'flora-consumer' });
 
 const fetchLatestMirrorTimestamp = async (
   stateTopicId: string,
@@ -36,24 +40,27 @@ const fetchLatestMirrorTimestamp = async (
   }
 };
 
-// manifest utilities moved to ./consumer/registry.ts
-
 export const startConsumer = async (
   overrides?: Partial<ConsumerConfig>
 ): Promise<ConsumerHandle> => {
   await initDb();
   const persistedHistory = await loadConsensusHistory();
 
-  const parseNumber = (value: string | undefined, fallback: number): number =>
-    Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const parseNumber = (value: string | undefined, fallback: number): number => {
+    const trimmed = value?.trim();
+    if (!trimmed) return fallback;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
 
-  const network = process.env.HEDERA_NETWORK ?? 'testnet';
+  const network = resolveNetwork(process.env.HEDERA_NETWORK);
 
   const base: ConsumerConfig = {
     quorum: parseNumber(process.env.QUORUM, 2),
     expectedPetals: parseNumber(process.env.EXPECTED_PETALS, 3),
     port: Number(process.env.PORT ?? '3000'),
     thresholdFingerprint: process.env.THRESHOLD_FINGERPRINT ?? 'demo-threshold',
+    floraAccountId: '',
     stateTopicId: '',
     coordinationTopicId: '',
     transactionTopicId: '',
@@ -84,43 +91,83 @@ export const startConsumer = async (
     );
   }
 
-  const hcs21 = new HCS21Client({ network, operatorId, operatorKey });
+  const operatorKeyType: HederaKeyType = await resolveOperatorKeyType({
+    mirrorBaseUrl: base.mirrorBaseUrl,
+    accountId: operatorId,
+  }).catch((error: unknown) => {
+    logger.warn('Failed to detect operator key type; defaulting to ECDSA', error);
+    return 'ecdsa' as const;
+  });
+
+  const hcs21 = new HCS21Client({
+    network,
+    operatorId,
+    operatorKey,
+    keyType: operatorKeyType,
+  });
   const hcs15 = new HCS15Client({
     network,
     operatorId,
     operatorKey,
+    keyType: operatorKeyType,
     mirrorNodeUrl: process.env.MIRROR_BASE_URL ?? 'https://testnet.mirrornode.hedera.com',
   });
 
-  // Provision petal accounts (HCS-15) + HCS-11 profiles and persist credentials
-  const petalAccounts = await provisionPetalAccounts(petalIds, hcs15, network);
+  const petalMinHbarBalance = parseNumber(process.env.PETAL_MIN_HBAR_BALANCE, 1);
+  const petalTargetHbarBalance = parseNumber(process.env.PETAL_TARGET_HBAR_BALANCE, 2);
 
-  // Resolve or create flora topics (state/coordination/transaction) via standards-sdk
-  const { stateTopicId, coordinationTopicId, transactionTopicId } = await resolveFloraTopics(
+  const petalAccounts = await provisionPetalAccounts(petalIds, hcs15, network, {
     operatorId,
     operatorKey,
-    network
-  );
+    operatorKeyType,
+    minHbarBalance: petalMinHbarBalance,
+    targetHbarBalance: petalTargetHbarBalance,
+  });
+  const memberAccounts = Object.values(petalAccounts).map((entry) => entry.accountId);
+  const memberPrivateKeys = Object.values(petalAccounts).map((entry) => entry.privateKey);
+  const floraThreshold = parseNumber(process.env.FLORA_THRESHOLD, petalIds.length);
+
+  const floraNetwork =
+    overrides?.floraAccountId &&
+    overrides.stateTopicId &&
+    overrides.coordinationTopicId &&
+    overrides.transactionTopicId
+      ? {
+          floraAccountId: overrides.floraAccountId,
+          stateTopicId: overrides.stateTopicId,
+          coordinationTopicId: overrides.coordinationTopicId,
+          transactionTopicId: overrides.transactionTopicId,
+        }
+      : await resolveFloraNetwork({
+          operatorId,
+          operatorKey,
+          operatorKeyType,
+          network,
+          members: memberAccounts,
+          memberPrivateKeys,
+          threshold: floraThreshold,
+        });
 
   const manifestPointers = await resolveManifestPointers(hcs21);
   const registryGraph = await ensureRegistryGraph(hcs21, operatorId, manifestPointers);
   await publishDeclarations(hcs21, registryGraph, manifestPointers, {
-    floraAccount: operatorId,
+    floraAccount: floraNetwork.floraAccountId,
     threshold: config.thresholdFingerprint,
-    stateTopic: stateTopicId,
-    coordinationTopic: coordinationTopicId,
-    transactionTopic: transactionTopicId,
+    stateTopic: floraNetwork.stateTopicId,
+    coordinationTopic: floraNetwork.coordinationTopicId,
+    transactionTopic: floraNetwork.transactionTopicId,
   });
 
   const merged: ConsumerConfig = {
     ...config,
+    floraAccountId: floraNetwork.floraAccountId,
     adapterCategoryTopicId: registryGraph.categoryTopicId,
     adapterDiscoveryTopicId: registryGraph.discoveryTopicId,
     adapterTopics: registryGraph.adapterTopics,
     adapterRegistryMetadataPointer: registryGraph.metadataPointer,
-    stateTopicId,
-    coordinationTopicId,
-    transactionTopicId,
+    stateTopicId: floraNetwork.stateTopicId,
+    coordinationTopicId: floraNetwork.coordinationTopicId,
+    transactionTopicId: floraNetwork.transactionTopicId,
   };
   const initialLastTimestamp =
     persistedHistory[persistedHistory.length - 1]?.timestamp ||
@@ -139,8 +186,7 @@ export const startConsumer = async (
     }
   );
   const server = app.listen(merged.port, () => {
-    // eslint-disable-next-line no-console
-    console.log(`Flora consumer listening on ${merged.port}`);
+    logger.info(`Flora consumer listening on ${merged.port}`);
   });
 
   return {

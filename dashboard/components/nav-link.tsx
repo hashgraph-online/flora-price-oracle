@@ -2,9 +2,10 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import type { Route } from 'next';
 
 interface NavLinkProps {
-  to?: string;
+  to?: Route;
   href?: string;
   label: string;
   external?: boolean;

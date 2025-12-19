@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-FROM node:24-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 RUN apk add --no-cache python3 make g++
 RUN corepack enable
@@ -10,13 +10,13 @@ COPY src ./src
 RUN pnpm install --frozen-lockfile --no-optional
 RUN pnpm run build
 
-FROM node:24-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
 RUN corepack enable
 COPY docker/petal.package.json package.json
 RUN pnpm install --prod --no-frozen-lockfile --no-optional
 
-FROM node:24-alpine AS petal
+FROM node:22-alpine AS petal
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /app/dist ./dist

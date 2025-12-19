@@ -1,6 +1,7 @@
 import "dotenv/config";
-import { HCS21Client } from "../../standards-sdk/dist/es/standards-sdk.es.js";
+import { HCS21Client, Logger } from "@hashgraphonline/standards-sdk";
 import type { AdapterDeclaration } from "../src/adapters/declarations.js";
+import { resolveNetwork } from "../src/lib/network.js";
 
 const buildDeclaration = (adapterId: string, pkgName: string, manifest: string, stopic: string): AdapterDeclaration => {
   return {
@@ -17,21 +18,20 @@ const buildDeclaration = (adapterId: string, pkgName: string, manifest: string, 
     manifest,
     config: {
       type: "flora",
-      flora: {
-        account: process.env.HEDERA_ACCOUNT_ID ?? "0.0.placeholder",
-        threshold: process.env.THRESHOLD_FINGERPRINT ?? "demo-threshold",
-        ctopic: process.env.CTOPIC_ID ?? "0.0.0",
-        ttopic: process.env.TTOPIC_ID ?? "0.0.0",
-        stopic,
-      },
+      account: process.env.HEDERA_ACCOUNT_ID ?? "0.0.placeholder",
+      threshold: process.env.THRESHOLD_FINGERPRINT ?? "demo-threshold",
+      ctopic: process.env.CTOPIC_ID ?? "0.0.0",
+      ttopic: process.env.TTOPIC_ID ?? "0.0.0",
+      stopic,
     },
     state_model: "hcs17:sha384",
   };
 };
 
 const main = async (): Promise<void> => {
+  const logger = Logger.getInstance({ module: "flora-script" });
   const client = new HCS21Client({
-    network: (process.env.HEDERA_NETWORK as "testnet" | "mainnet" | "previewnet") ?? "testnet",
+    network: resolveNetwork(process.env.HEDERA_NETWORK),
     operatorId: process.env.HEDERA_ACCOUNT_ID ?? "",
     operatorKey: process.env.HEDERA_PRIVATE_KEY ?? "",
     mirrorNodeUrl: process.env.MIRROR_BASE_URL,
@@ -43,8 +43,7 @@ const main = async (): Promise<void> => {
       : await client.createRegistryTopic({ ttl: 3600, indexed: 0, type: 0 });
 
   const manifestPointer = (process.env.ADAPTER_MANIFEST_POINTER ?? `hcs://1/${process.env.STATE_TOPIC_ID ?? registryTopic}`).trim();
-  // eslint-disable-next-line no-console
-  console.log(`Using manifest pointer: ${manifestPointer}`);
+  logger.info(`Using manifest pointer: ${manifestPointer}`);
 
   const declarations: AdapterDeclaration[] = [
     buildDeclaration("binance", "@hol-org/adapter-binance", manifestPointer, process.env.STATE_TOPIC_ID ?? registryTopic),
@@ -56,13 +55,12 @@ const main = async (): Promise<void> => {
       topicId: registryTopic,
       declaration: decl,
     });
-    // eslint-disable-next-line no-console
-    console.log(`Published ${decl.adapter_id} (seq=${result.sequenceNumber ?? "?"}) to ${registryTopic}`);
+    logger.info(`Published ${decl.adapter_id} (seq=${result.sequenceNumber ?? "?"}) to ${registryTopic}`);
   }
 };
 
 main().catch((error) => {
-  // eslint-disable-next-line no-console
-  console.error(error);
+  const logger = Logger.getInstance({ module: "flora-script" });
+  logger.error(error);
   process.exit(1);
 });

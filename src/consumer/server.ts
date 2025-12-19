@@ -1,5 +1,6 @@
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import fetch from 'node-fetch';
+import { Logger } from '@hashgraphonline/standards-sdk';
 import { aggregateConsensus } from './consensus.js';
 import type {
   ProofPayload,
@@ -8,6 +9,12 @@ import type {
   PetalAdapterState,
   ConsumerHandle,
 } from './types.js';
+import {
+  type ChunkedProofPayload,
+  getEpochFromPayload,
+  isChunkedProofPayload,
+  isProofPayload,
+} from './validation.js';
 
 export const buildConsumer = (
   config: ConsumerConfig,
@@ -20,6 +27,7 @@ export const buildConsumer = (
   app: express.Express;
   getLatest: () => ConsensusEntry | null;
   waitForConsensus: (timeoutMs: number) => Promise<ConsensusEntry | null>;
+  stopPolling: () => void;
 } => {
   const proofsByEpoch = new Map<number, ProofPayload[]>();
   const history: ConsensusEntry[] = [...(options.initialHistory ?? [])];
@@ -36,11 +44,16 @@ export const buildConsumer = (
       parts: (string | undefined)[];
     }
   > = new Map();
+  const accountKeyCache = new Map<
+    string,
+    { fetchedAt: number; keyType: string; publicKey: string }
+  >();
+  const ACCOUNT_KEY_TTL_MS = 5 * 60 * 1000;
   const {
     quorum,
     expectedPetals,
-    port,
     thresholdFingerprint,
+    floraAccountId,
     stateTopicId,
     coordinationTopicId,
     transactionTopicId,
@@ -53,6 +66,10 @@ export const buildConsumer = (
     adapterRegistryMetadataPointer,
   } = config;
 
+  if (!floraAccountId) {
+    throw new Error('FLORA_ACCOUNT_ID is required for consumer');
+  }
+
   if (!stateTopicId) {
     throw new Error('STATE_TOPIC_ID is required for consumer');
   }
@@ -63,7 +80,43 @@ export const buildConsumer = (
 
   const serverApp = express();
   const persistConsensus = options.persistConsensus;
-  serverApp.use((req, res, next) => {
+  const logger = Logger.getInstance({ module: 'flora-consumer' });
+
+  const normalizeMirrorBaseUrl = (value: string): string => {
+    const trimmed = value.trim().replace(/\/+$/, '');
+    return trimmed.endsWith('/api/v1') ? trimmed.slice(0, -'/api/v1'.length) : trimmed;
+  };
+
+  const fetchAccountKey = async (
+    accountId: string
+  ): Promise<{ keyType: string; publicKey: string } | null> => {
+    const cached = accountKeyCache.get(accountId);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt < ACCOUNT_KEY_TTL_MS) {
+      return { keyType: cached.keyType, publicKey: cached.publicKey };
+    }
+
+    const base = normalizeMirrorBaseUrl(mirrorBaseUrl);
+    const url = `${base}/api/v1/accounts/${accountId}`;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return null;
+      const body = (await response.json()) as {
+        key?: { _type?: string; key?: string };
+      };
+      const keyType = body.key?._type;
+      const publicKey = body.key?.key;
+      if (typeof keyType !== 'string' || typeof publicKey !== 'string') {
+        return null;
+      }
+      accountKeyCache.set(accountId, { fetchedAt: now, keyType, publicKey });
+      return { keyType, publicKey };
+    } catch {
+      return null;
+    }
+  };
+
+  serverApp.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -75,38 +128,49 @@ export const buildConsumer = (
   });
   serverApp.use(express.json({ limit: '1mb' }));
 
-  serverApp.post('/proof', (req, res) => {
-    const proof = req.body as ProofPayload;
-    // lightweight debug log for ingestion visibility
-    // eslint-disable-next-line no-console
-    console.log(
-      `[proof] received epoch=${proof?.epoch} petal=${
-        proof?.petalId
-      } participants=${proof?.participants?.length ?? 0}`
+  serverApp.post('/proof', (req: Request, res: Response) => {
+    const payload: unknown = req.body;
+
+    if (isChunkedProofPayload(payload)) {
+      if (payload.floraAccountId !== floraAccountId) {
+        logger.warn('[proof] rejected: flora account mismatch');
+        return res.status(400).json({ error: 'Invalid flora account' });
+      }
+      ingestProof(payload);
+      return res.json({ status: 'accepted' });
+    }
+
+    if (!isProofPayload(payload)) {
+      logger.warn('[proof] rejected: invalid payload');
+      return res.status(400).json({ error: 'Invalid proof payload' });
+    }
+
+    logger.info(
+      `[proof] received epoch=${payload.epoch} petal=${payload.petalId} participants=${payload.participants.length}`
     );
 
-    if (proof.thresholdFingerprint !== thresholdFingerprint) {
-      // eslint-disable-next-line no-console
-      console.warn('[proof] rejected: threshold mismatch');
+    if (payload.floraAccountId !== floraAccountId) {
+      logger.warn('[proof] rejected: flora account mismatch');
+      return res.status(400).json({ error: 'Invalid flora account' });
+    }
+    if (payload.thresholdFingerprint !== thresholdFingerprint) {
+      logger.warn('[proof] rejected: threshold mismatch');
       return res.status(400).json({ error: 'Invalid threshold fingerprint' });
     }
-    if (proof.registryTopicId !== adapterCategoryTopicId) {
-      // eslint-disable-next-line no-console
-      console.warn('[proof] rejected: registry topic mismatch');
+    if (payload.registryTopicId !== adapterCategoryTopicId) {
+      logger.warn('[proof] rejected: registry topic mismatch');
       return res.status(400).json({ error: 'Unexpected registry topic' });
     }
-    if (!proof.participants || proof.participants.length !== expectedPetals) {
-      // eslint-disable-next-line no-console
-      console.warn('[proof] rejected: participants mismatch');
+    if (payload.participants.length !== expectedPetals) {
+      logger.warn('[proof] rejected: participants mismatch');
       return res.status(400).json({ error: 'Unexpected participants' });
     }
 
-    ingestProof(proof);
-
+    ingestProof(payload);
     return res.json({ status: 'accepted' });
   });
 
-  serverApp.get('/price/latest', (_req, res) => {
+  serverApp.get('/price/latest', (_req: Request, res: Response) => {
     const latest = history[history.length - 1];
     if (!latest) {
       return res.status(404).json({ error: 'No consensus yet' });
@@ -117,7 +181,7 @@ export const buildConsumer = (
     });
   });
 
-  serverApp.get('/price/history', (_req, res) => {
+  serverApp.get('/price/history', (_req: Request, res: Response) => {
     const ordered = [...history].reverse();
     const limit = Math.max(
       1,
@@ -136,51 +200,97 @@ export const buildConsumer = (
     });
   });
 
-  serverApp.get('/health', (_req, res) => {
+  serverApp.get('/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok' });
   });
 
-  serverApp.get('/adapters', (_req, res) => {
+  serverApp.get('/adapters', async (_req: Request, res: Response) => {
     const petals = Array.from(petalAdapters.values()).sort((a, b) =>
       a.petalId.localeCompare(b.petalId)
     );
+    const petalsWithKeys = await Promise.all(
+      petals.map(async (entry) => {
+        if (!entry.accountId) return entry;
+        const key = await fetchAccountKey(entry.accountId);
+        if (!key) return entry;
+        return {
+          ...entry,
+          publicKey: key.publicKey,
+          keyType: key.keyType,
+        };
+      })
+    );
+    const floraKey = await fetchAccountKey(floraAccountId);
     const aggregateFingerprints: Record<string, string> = {};
     const aggregateAdapters = new Set<string>();
-    petals.forEach((entry) => {
+    petalsWithKeys.forEach((entry) => {
       entry.adapters.forEach((adapterId) => aggregateAdapters.add(adapterId));
       Object.entries(entry.fingerprints).forEach(([id, fp]) => {
         aggregateFingerprints[id] = fp;
       });
     });
     res.json({
-      petals,
-        aggregate: {
-          adapters: Array.from(aggregateAdapters).sort(),
-          fingerprints: aggregateFingerprints,
-          registry: {
-            categoryTopicId: adapterCategoryTopicId,
-            discoveryTopicId: adapterDiscoveryTopicId,
-            adapterTopics,
-          },
+      petals: petalsWithKeys,
+      flora: {
+        accountId: floraAccountId,
+        publicKey: floraKey?.publicKey,
+        keyType: floraKey?.keyType,
+      },
+      aggregate: {
+        adapters: Array.from(aggregateAdapters).sort(),
+        fingerprints: aggregateFingerprints,
+        registry: {
+          categoryTopicId: adapterCategoryTopicId,
+          discoveryTopicId: adapterDiscoveryTopicId,
+          adapterTopics,
         },
-        topics: {
-          state: stateTopicId,
-          coordination: coordinationTopicId,
-          transaction: transactionTopicId,
-          registryCategory: adapterCategoryTopicId,
-          registryDiscovery: adapterDiscoveryTopicId,
-        },
-        metadata: {
-          registryPointer: adapterRegistryMetadataPointer,
-          network,
-        },
+      },
+      topics: {
+        state: stateTopicId,
+        coordination: coordinationTopicId,
+        transaction: transactionTopicId,
+        registryCategory: adapterCategoryTopicId,
+        registryDiscovery: adapterDiscoveryTopicId,
+      },
+      metadata: {
+        registryPointer: adapterRegistryMetadataPointer,
+        network,
+        floraAccountId,
+      },
     });
   });
 
   let pollTimer: NodeJS.Timeout | null = null;
   let lastTimestamp = options.initialLastTimestamp ?? '0';
 
-  const ingestProof = (proof: ProofPayload) => {
+  const ingestProof = (proof: ProofPayload | ChunkedProofPayload) => {
+    if (isChunkedProofPayload(proof)) {
+      const key = `${proof.petalId}-${proof.epoch}`;
+      const existing = chunkBuffer.get(key) ?? {
+        total: proof.total_chunks,
+        parts: new Array(proof.total_chunks),
+      };
+      existing.parts[proof.chunk_id - 1] = proof.data;
+      chunkBuffer.set(key, existing);
+      if (existing.parts.every((part) => part !== undefined)) {
+        const assembled = existing.parts.join('');
+        try {
+          const parsed = JSON.parse(assembled) as unknown;
+          if (!isProofPayload(parsed)) {
+            logger.warn('[proof] rejected: invalid chunk assembly');
+            chunkBuffer.delete(key);
+            return;
+          }
+          chunkBuffer.delete(key);
+          ingestProof(parsed);
+          return;
+        } catch {
+          logger.warn('[proof] rejected: chunk assembly failed');
+        }
+      }
+      return;
+    }
+
     const meta = metaByEpoch.get(proof.epoch);
     const hcsPointer = `hcs://17/${stateTopicId}`;
     const enriched: ProofPayload = {
@@ -190,34 +300,10 @@ export const buildConsumer = (
       sequenceNumber: meta?.sequenceNumber ?? proof.sequenceNumber,
     };
 
-    // handle chunked payloads
-    // @ts-ignore: partial chunk typing for brevity
-    if (enriched.chunk_id && enriched.total_chunks && enriched.data) {
-      const key = `${enriched.petalId}-${enriched.epoch}`;
-      const existing = chunkBuffer.get(key) ?? {
-        total: enriched.total_chunks,
-        parts: new Array(enriched.total_chunks),
-      };
-      existing.parts[enriched.chunk_id - 1] = enriched.data as unknown as string;
-      chunkBuffer.set(key, existing);
-      if (existing.parts.every((part) => part !== undefined)) {
-        const assembled = existing.parts.join('');
-        try {
-          const parsed = JSON.parse(assembled) as ProofPayload;
-          chunkBuffer.delete(key);
-          ingestProof(parsed);
-          return;
-        } catch {
-          // ignore malformed chunk assembly
-        }
-      }
-      return;
-    }
-
     const adapterIds = Object.keys(enriched.adapterFingerprints ?? {}).sort();
     petalAdapters.set(enriched.petalId, {
       petalId: enriched.petalId,
-      accountId: enriched.accountId,
+      accountId: enriched.petalAccountId,
       epoch: enriched.epoch,
       timestamp: enriched.timestamp,
       adapters: adapterIds,
@@ -250,7 +336,6 @@ export const buildConsumer = (
         history.sort((a, b) => a.epoch - b.epoch);
         if (options.persistConsensus) {
           void options.persistConsensus(consensus).catch(() => {
-            // persistence failure is non-fatal for demo
           });
         }
       }
@@ -289,7 +374,6 @@ export const buildConsumer = (
       history[idx] = updated;
       if (persistConsensus) {
         void persistConsensus(updated).catch(() => {
-          // persistence failure is non-fatal for demo
         });
       }
     }
@@ -319,16 +403,12 @@ export const buildConsumer = (
       lastTimestamp = ts;
       try {
         const decoded = Buffer.from(entry.message, 'base64').toString('utf8');
-        const payload = JSON.parse(decoded) as Partial<ProofPayload> & {
-          epoch?: number;
-        };
+        const payload = JSON.parse(decoded) as unknown;
 
+        const payloadEpoch = getEpochFromPayload(payload);
         const targetEpoch =
-          typeof payload.epoch === 'number'
-            ? payload.epoch
-            : metaQueue.length > 0
-            ? metaQueue[0]
-            : undefined;
+          payloadEpoch ??
+          (metaQueue.length > 0 ? metaQueue[0] : undefined);
 
         if (typeof targetEpoch === 'number') {
           applyMeta(targetEpoch, {
@@ -337,20 +417,16 @@ export const buildConsumer = (
           });
         }
 
-        if (
-          payload.records &&
-          Array.isArray(payload.records) &&
-          payload.records.length > 0
-        ) {
+        if (isProofPayload(payload)) {
           ingestProof({
-            ...(payload as ProofPayload),
+            ...payload,
             hcsMessage: `hcs://17/${stateTopicId}`,
             consensusTimestamp: ts,
             sequenceNumber: entry.sequence_number,
           });
         }
       } catch {
-        // ignore malformed entries
+        logger.warn('[mirror] message parse failed');
       }
     }
   };

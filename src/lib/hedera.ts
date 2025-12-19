@@ -1,6 +1,6 @@
 import { HCS17Client, HCS16Client, FloraTopicType } from "@hashgraphonline/standards-sdk";
-
-const resolveNetwork = (): string => process.env.HEDERA_NETWORK ?? "testnet";
+import { resolveNetwork } from "./network.js";
+import { resolveOperatorKeyType } from "./operator-key-type.js";
 
 const resolveOperator = (): { accountId: string; privateKey: string } => {
   const accountId = process.env.HEDERA_ACCOUNT_ID ?? process.env.TESTNET_HEDERA_ACCOUNT_ID;
@@ -21,10 +21,16 @@ export const ensureTopic = async (topicId?: string, memo?: string): Promise<stri
     return topicId;
   }
   const { accountId, privateKey } = resolveOperator();
-  const network = resolveNetwork();
+  const network = resolveNetwork(process.env.HEDERA_NETWORK);
   if (!memo) {
     throw new Error("Memo required to create topic via standards-sdk");
   }
+
+  const mirrorNodeUrl = process.env.MIRROR_BASE_URL ?? "https://testnet.mirrornode.hedera.com";
+  const keyType = await resolveOperatorKeyType({
+    mirrorBaseUrl: mirrorNodeUrl,
+    accountId,
+  });
 
   const hcs17Match = memo.match(/^hcs-17:(\d+):(\d+)$/);
   if (hcs17Match) {
@@ -33,7 +39,8 @@ export const ensureTopic = async (topicId?: string, memo?: string): Promise<stri
       network,
       operatorId: accountId,
       operatorKey: privateKey,
-      mirrorNodeUrl: process.env.MIRROR_BASE_URL ?? "https://testnet.mirrornode.hedera.com",
+      mirrorNodeUrl,
+      keyType,
     });
     return await client.createStateTopic({ ttl });
   }
@@ -46,6 +53,7 @@ export const ensureTopic = async (topicId?: string, memo?: string): Promise<stri
       network,
       operatorId: accountId,
       operatorKey: privateKey,
+      keyType,
     });
     return await floraClient.createFloraTopic({ floraAccountId, topicType });
   }

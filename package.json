@@ -11,29 +11,32 @@
     "start:consumer": "tsx src/consumer.ts",
     "start:petal": "tsx src/petal.ts",
     "lint": "echo \"No lint configured\"",
-    "test": "tsx scripts/smoke.ts"
+    "test": "tsx scripts/smoke.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hashgraph/sdk": "^2.77.0",
+    "@hashgraphonline/standards-sdk": "0.1.141-canary.41",
     "@hol-org/adapter-binance": "workspace:0.1.3",
     "@hol-org/adapter-coingecko": "workspace:0.1.2",
     "@hol-org/adapter-hedera-rate": "workspace:0.1.2",
-    "@hashgraph/sdk": "^2.77.0",
-    "@hashgraphonline/standards-sdk": "0.1.141-canary.38",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "pg": "^8.13.1",
     "node-fetch": "^3.3.2",
+    "pg": "^8.13.1",
     "tsx": "^4.7.0",
     "typescript": "^5.6.3"
   },
   "resolutions": {
     "@reown/appkit": "1.8.9",
     "@hashgraph/hedera-wallet-connect": "2.0.3",
-    "@hashgraphonline/standards-sdk": "0.1.141-canary.38",
+    "@hashgraphonline/standards-sdk": "0.1.141-canary.41",
     "@hashgraphonline/hashinal-wc": "2.0.1",
     "@hashgraph/sdk": "2.77.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/pg": "^8.16.0",
     "esbuild": "^0.24.2"
   }
 }

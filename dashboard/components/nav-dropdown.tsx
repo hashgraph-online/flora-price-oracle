@@ -3,10 +3,11 @@
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import type { Route } from 'next';
 
 interface DropdownItem {
   label: string;
-  to?: string;
+  to?: Route;
   href?: string;
   className?: string;
 }

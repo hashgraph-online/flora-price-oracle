@@ -1,10 +1,13 @@
 import type { AdapterRecord } from '../adapters/types.js';
+import type { NetworkType } from '@hashgraphonline/standards-sdk';
 
 export type ProofPayload = {
   epoch: number;
   stateHash: string;
   thresholdFingerprint: string;
   petalId: string;
+  petalAccountId: string;
+  floraAccountId: string;
   participants: string[];
   records: AdapterRecord[];
   timestamp: string;
@@ -32,10 +35,11 @@ export type ConsumerConfig = {
   expectedPetals: number;
   port: number;
   thresholdFingerprint: string;
+  floraAccountId: string;
   stateTopicId: string;
   coordinationTopicId: string;
   transactionTopicId: string;
-  network: string;
+  network: NetworkType;
   mirrorBaseUrl: string;
   pollIntervalMs: number;
   adapterCategoryTopicId: string;
@@ -50,6 +54,8 @@ export type ConsumerConfig = {
 export type PetalAdapterState = {
   petalId: string;
   accountId?: string;
+  publicKey?: string;
+  keyType?: string;
   epoch: number;
   timestamp: string;
   adapters: string[];

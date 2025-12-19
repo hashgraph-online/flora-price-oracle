@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-FROM node:24-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 RUN apk add --no-cache python3 make g++
 RUN corepack enable
@@ -12,7 +12,7 @@ RUN pnpm install --frozen-lockfile --no-optional
 RUN pnpm run build
 RUN pnpm prune --prod
 
-FROM node:24-alpine AS consumer
+FROM node:22-alpine AS consumer
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /app/dist ./dist

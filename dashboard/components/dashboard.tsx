@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { FaCube, FaHistory, FaProjectDiagram } from 'react-icons/fa';
 import { Button } from './button';
+import { FloraMembers, type FloraMember } from './flora-members';
 import { HeroSection } from './hero-section';
 import { Typography, GlassCard, StatusBadge } from './ui';
 import { cn } from '../lib/utils';
@@ -23,6 +24,9 @@ type HistoryResponse = { items: PriceEntry[] };
 
 type AdapterPetal = {
   petalId: string;
+  accountId?: string;
+  keyType?: string;
+  publicKey?: string;
   epoch: number;
   timestamp: string;
   adapters: string[];
@@ -31,6 +35,11 @@ type AdapterPetal = {
 
 type AdapterResponse = {
   petals: AdapterPetal[];
+  flora?: {
+    accountId?: string;
+    keyType?: string;
+    publicKey?: string;
+  };
   aggregate: {
     adapters: string[];
     fingerprints: Record<string, string>;
@@ -57,6 +66,7 @@ type AdapterResponse = {
   metadata: {
     registryPointer: string;
     network: string;
+    floraAccountId?: string;
   };
 };
 
@@ -230,6 +240,28 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
       ].filter((entry) => Boolean(entry.value)),
       adapterTopicEntries,
     };
+  }, [adapters]);
+
+  const floraMembers: FloraMember[] = useMemo(() => {
+    const petals = (adapters?.petals ?? []).map((petal) => ({
+      label: petal.petalId,
+      accountId: petal.accountId,
+      keyType: petal.keyType,
+      publicKey: petal.publicKey,
+    }));
+
+    const flora = adapters?.flora?.accountId
+      ? [
+          {
+            label: 'Flora account',
+            accountId: adapters.flora.accountId,
+            keyType: adapters.flora.keyType,
+            publicKey: adapters.flora.publicKey,
+          },
+        ]
+      : [];
+
+    return [...flora, ...petals];
   }, [adapters]);
 
   return (
@@ -415,6 +447,16 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
                   </div>
                 )}
               </div>
+            </GlassCard>
+
+            <GlassCard className="p-6 space-y-4">
+              <div>
+                <Typography variant="h3">Flora Members</Typography>
+                <Typography variant="body2" color="muted">
+                  Account IDs and public keys (from Mirror Node)
+                </Typography>
+              </div>
+              <FloraMembers members={floraMembers} />
             </GlassCard>
 
             {registryLinks && (
