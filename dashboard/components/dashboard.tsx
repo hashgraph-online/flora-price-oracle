@@ -33,8 +33,16 @@ type AdapterPetal = {
   fingerprints: Record<string, string>;
 };
 
+type AdapterMember = {
+  petalId: string;
+  accountId?: string;
+  keyType?: string;
+  publicKey?: string;
+};
+
 type AdapterResponse = {
   petals: AdapterPetal[];
+  members?: AdapterMember[];
   flora?: {
     accountId?: string;
     keyType?: string;
@@ -105,7 +113,7 @@ const packageLink = (id: string): string | null => {
   const match = /^npm\/(.+?)(?:@([\w.-]+))?$/i.exec(id.trim());
   if (!match) return null;
   const [, pkg, version] = match;
-  const pkgPath = pkg; // npm supports scoped names with slash intact
+  const pkgPath = pkg;
   if (version) {
     return `https://www.npmjs.com/package/${pkgPath}/v/${encodeURIComponent(version)}`;
   }
@@ -135,12 +143,28 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const baseUrl = useMemo(() => {
-    if (typeof window !== 'undefined') {
-      const url = new URL(apiBase.replace(/\/$/, ''));
-      const port = url.port || '3000';
-      return `${window.location.protocol}//${window.location.hostname}:${port}`;
+    const trimmed = apiBase.trim().replace(/\/$/, '');
+    if (!trimmed) return '';
+    if (typeof window === 'undefined') return trimmed;
+    if (trimmed.startsWith('/')) {
+      return `${window.location.origin}${trimmed}`;
     }
-    return apiBase.replace(/\/$/, '');
+
+    try {
+      const url = new URL(trimmed);
+      const shouldRewriteHost =
+        url.hostname === 'flora-consumer' || url.hostname.endsWith('.svc') || url.hostname.endsWith('.cluster.local');
+      const shouldRewriteOrigin =
+        shouldRewriteHost || (typeof window !== 'undefined' && url.hostname === window.location.hostname);
+      if (shouldRewriteOrigin) {
+        url.protocol = window.location.protocol;
+        url.hostname = window.location.hostname;
+        url.port = window.location.port;
+      }
+      return url.toString().replace(/\/$/, '');
+    } catch {
+      return trimmed;
+    }
   }, [apiBase]);
 
   useEffect(() => {
@@ -181,6 +205,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
     petals: adapters?.petals.length ?? 0,
     adapters: adapters?.aggregate.adapters.length ?? 0,
   };
+  const networkLabel = adapters?.metadata?.network;
 
   const registryLinks = useMemo(() => {
     if (!adapters) return null;
@@ -243,7 +268,8 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   }, [adapters]);
 
   const floraMembers: FloraMember[] = useMemo(() => {
-    const petals = (adapters?.petals ?? []).map((petal) => ({
+    const memberSource = adapters?.members ?? adapters?.petals ?? [];
+    const petals = memberSource.map((petal) => ({
       label: petal.petalId,
       accountId: petal.accountId,
       keyType: petal.keyType,
@@ -266,7 +292,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-white dark:from-gray-950 dark:to-gray-900">
-      <HeroSection metrics={metrics} />
+      <HeroSection metrics={metrics} networkLabel={networkLabel} />
 
       <div className='max-w-7xl mx-auto px-6 pb-20 space-y-12 -mt-10 relative z-20'>
         {error && (
@@ -275,7 +301,6 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
           </div>
         )}
 
-        {/* Key Metrics Grid */}
         <div className='grid grid-cols-1 md:grid-cols-3 gap-6'>
           <GlassCard className="p-6">
             <div className="flex items-center gap-3 mb-4">
@@ -353,7 +378,6 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
         </div>
 
         <div className='grid grid-cols-1 lg:grid-cols-3 gap-8'>
-          {/* History Table */}
           <GlassCard className='lg:col-span-2 p-0 overflow-hidden'>
             <div className="p-6 border-b border-gray-100 dark:border-gray-800">
               <Typography variant="h3">Recent Consensus</Typography>
@@ -407,7 +431,6 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             </div>
           </GlassCard>
 
-          {/* Petals List */}
           <div className='space-y-8'>
             <GlassCard className="p-6 h-fit">
               <div className="mb-6">

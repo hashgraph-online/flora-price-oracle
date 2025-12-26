@@ -11,12 +11,12 @@ export const buildHederaClient = (params: {
   const client =
     params.network === "mainnet" ? Client.forMainnet() : Client.forTestnet();
 
-  const operatorPrivateKey =
-    params.operatorKeyType === "ed25519"
+  const operatorPrivateKey = params.operatorKeyType
+    ? params.operatorKeyType === "ed25519"
       ? PrivateKey.fromStringED25519(params.operatorKey)
-      : PrivateKey.fromStringECDSA(params.operatorKey);
+      : PrivateKey.fromStringECDSA(params.operatorKey)
+    : PrivateKey.fromString(params.operatorKey);
 
   client.setOperator(AccountId.fromString(params.operatorId), operatorPrivateKey);
   return client;
 };
-

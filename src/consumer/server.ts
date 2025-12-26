@@ -1,5 +1,4 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
-import fetch from 'node-fetch';
 import { Logger } from '@hashgraphonline/standards-sdk';
 import { aggregateConsensus } from './consensus.js';
 import type {
@@ -9,6 +8,10 @@ import type {
   PetalAdapterState,
   ConsumerHandle,
 } from './types.js';
+import type { PublishedConsensusMeta } from "./state-topic-publisher.js";
+import { createAccountKeyFetcher } from "./account-keys.js";
+import { sortAccountIds } from "./leader.js";
+import { createStateTopicPoller } from "./state-topic-poller.js";
 import {
   type ChunkedProofPayload,
   getEpochFromPayload,
@@ -22,6 +25,10 @@ export const buildConsumer = (
     initialHistory?: ConsensusEntry[];
     persistConsensus?: (entry: ConsensusEntry) => Promise<void>;
     initialLastTimestamp?: string;
+    publishConsensus?: (
+      entry: ConsensusEntry,
+      proofs: ProofPayload[],
+    ) => Promise<PublishedConsensusMeta | null>;
   } = {}
 ): {
   app: express.Express;
@@ -37,6 +44,11 @@ export const buildConsumer = (
     { consensusTimestamp?: string; sequenceNumber?: number }
   >();
   const metaQueue: number[] = [];
+  const publishConsensus = options.publishConsensus;
+  const publishedConsensus = new Map<number, string>();
+  const publishingConsensus = new Map<number, string>();
+  const publishRetryTimers = new Map<number, NodeJS.Timeout>();
+  const publishRetryAttempts = new Map<number, number>();
   const chunkBuffer: Map<
     string,
     {
@@ -44,15 +56,11 @@ export const buildConsumer = (
       parts: (string | undefined)[];
     }
   > = new Map();
-  const accountKeyCache = new Map<
-    string,
-    { fetchedAt: number; keyType: string; publicKey: string }
-  >();
-  const ACCOUNT_KEY_TTL_MS = 5 * 60 * 1000;
   const {
     quorum,
     expectedPetals,
     thresholdFingerprint,
+    petalAccountsById,
     floraAccountId,
     stateTopicId,
     coordinationTopicId,
@@ -65,57 +73,23 @@ export const buildConsumer = (
     adapterTopics,
     adapterRegistryMetadataPointer,
   } = config;
-
   if (!floraAccountId) {
     throw new Error('FLORA_ACCOUNT_ID is required for consumer');
   }
-
   if (!stateTopicId) {
     throw new Error('STATE_TOPIC_ID is required for consumer');
   }
-
   if (!coordinationTopicId || !transactionTopicId) {
     throw new Error('Coordination and transaction topics are required for consumer');
   }
-
+  const participantAccounts = petalAccountsById
+    ? sortAccountIds(Object.values(petalAccountsById))
+    : [];
+  const petalStateTopicsById = new Map<string, string>();
   const serverApp = express();
   const persistConsensus = options.persistConsensus;
   const logger = Logger.getInstance({ module: 'flora-consumer' });
-
-  const normalizeMirrorBaseUrl = (value: string): string => {
-    const trimmed = value.trim().replace(/\/+$/, '');
-    return trimmed.endsWith('/api/v1') ? trimmed.slice(0, -'/api/v1'.length) : trimmed;
-  };
-
-  const fetchAccountKey = async (
-    accountId: string
-  ): Promise<{ keyType: string; publicKey: string } | null> => {
-    const cached = accountKeyCache.get(accountId);
-    const now = Date.now();
-    if (cached && now - cached.fetchedAt < ACCOUNT_KEY_TTL_MS) {
-      return { keyType: cached.keyType, publicKey: cached.publicKey };
-    }
-
-    const base = normalizeMirrorBaseUrl(mirrorBaseUrl);
-    const url = `${base}/api/v1/accounts/${accountId}`;
-    try {
-      const response = await fetch(url);
-      if (!response.ok) return null;
-      const body = (await response.json()) as {
-        key?: { _type?: string; key?: string };
-      };
-      const keyType = body.key?._type;
-      const publicKey = body.key?.key;
-      if (typeof keyType !== 'string' || typeof publicKey !== 'string') {
-        return null;
-      }
-      accountKeyCache.set(accountId, { fetchedAt: now, keyType, publicKey });
-      return { keyType, publicKey };
-    } catch {
-      return null;
-    }
-  };
-
+  const fetchAccountKey = createAccountKeyFetcher({ mirrorBaseUrl });
   serverApp.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -128,10 +102,107 @@ export const buildConsumer = (
   });
   serverApp.use(express.json({ limit: '1mb' }));
 
-  serverApp.post('/proof', (req: Request, res: Response) => {
+  const hasExpectedParticipants = (participants: string[]): boolean => {
+    const expectedCount =
+      participantAccounts.length > 0 ? participantAccounts.length : expectedPetals;
+    if (expectedCount > 0 && participants.length !== expectedCount) return false;
+    if (participantAccounts.length === 0) return true;
+    const normalized = sortAccountIds(participants);
+    if (normalized.length !== participantAccounts.length) return false;
+    return normalized.every((accountId, index) => accountId === participantAccounts[index]);
+  };
+
+  const getLatestPublishedConsensus = (): ConsensusEntry | null => {
+    for (let idx = history.length - 1; idx >= 0; idx -= 1) {
+      const entry = history[idx];
+      if (!entry) continue;
+      if (typeof entry.consensusTimestamp === "string" && entry.consensusTimestamp.length > 0) {
+        return entry;
+      }
+    }
+    return null;
+  };
+
+  const scheduleConsensusPublish = (entry: ConsensusEntry, proofs: ProofPayload[]) => {
+    if (!publishConsensus) return;
+    const existing = publishedConsensus.get(entry.epoch);
+    if (existing === entry.stateHash) return;
+    const inFlight = publishingConsensus.get(entry.epoch);
+    if (inFlight === entry.stateHash) return;
+    publishingConsensus.set(entry.epoch, entry.stateHash);
+    const existingTimer = publishRetryTimers.get(entry.epoch);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      publishRetryTimers.delete(entry.epoch);
+    }
+
+    void publishConsensus(entry, proofs)
+      .then((meta) => {
+        if (!meta) {
+          const attempts = (publishRetryAttempts.get(entry.epoch) ?? 0) + 1;
+          publishRetryAttempts.set(entry.epoch, attempts);
+          const delayMs = Math.min(120_000, 5_000 * attempts);
+          if (!publishRetryTimers.has(entry.epoch)) {
+            const timer = setTimeout(() => {
+              publishRetryTimers.delete(entry.epoch);
+              const latestEntry = history.find((item) => item.epoch === entry.epoch);
+              if (!latestEntry) return;
+              const latestProofs = proofsByEpoch.get(entry.epoch) ?? proofs;
+              scheduleConsensusPublish(latestEntry, latestProofs);
+            }, delayMs);
+            publishRetryTimers.set(entry.epoch, timer);
+          }
+          return;
+        }
+        publishRetryAttempts.delete(entry.epoch);
+        publishedConsensus.set(entry.epoch, entry.stateHash);
+        const idx = history.findIndex((item) => item.epoch === entry.epoch);
+        if (idx < 0) return;
+        const updated: ConsensusEntry = {
+          ...history[idx],
+          consensusTimestamp: history[idx].consensusTimestamp ?? meta.consensusTimestamp,
+          sequenceNumber: history[idx].sequenceNumber ?? meta.sequenceNumber,
+          hcsMessage: history[idx].hcsMessage ?? meta.hcsMessage,
+        };
+        history[idx] = updated;
+        if (persistConsensus) {
+          void persistConsensus(updated).catch(() => {});
+        }
+      })
+      .catch((error: unknown) => {
+        logger.warn("Consensus state publish failed", { epoch: entry.epoch, error });
+        const attempts = (publishRetryAttempts.get(entry.epoch) ?? 0) + 1;
+        publishRetryAttempts.set(entry.epoch, attempts);
+        const delayMs = Math.min(120_000, 5_000 * attempts);
+        if (!publishRetryTimers.has(entry.epoch)) {
+          const timer = setTimeout(() => {
+            publishRetryTimers.delete(entry.epoch);
+            const latestEntry = history.find((item) => item.epoch === entry.epoch);
+            if (!latestEntry) return;
+            const latestProofs = proofsByEpoch.get(entry.epoch) ?? proofs;
+            scheduleConsensusPublish(latestEntry, latestProofs);
+          }, delayMs);
+          publishRetryTimers.set(entry.epoch, timer);
+        }
+      })
+      .finally(() => {
+        publishingConsensus.delete(entry.epoch);
+      });
+  };
+
+  serverApp.post(['/proof', '/api/proof'], (req: Request, res: Response) => {
     const payload: unknown = req.body;
 
     if (isChunkedProofPayload(payload)) {
+      const expectedAccountId = petalAccountsById?.[payload.petalId];
+      if (expectedAccountId && payload.petalAccountId !== expectedAccountId) {
+        logger.warn('[proof] rejected: petal account mismatch', {
+          petalId: payload.petalId,
+          expectedAccountId,
+          petalAccountId: payload.petalAccountId,
+        });
+        return res.status(400).json({ error: 'Invalid petal account' });
+      }
       if (payload.floraAccountId !== floraAccountId) {
         logger.warn('[proof] rejected: flora account mismatch');
         return res.status(400).json({ error: 'Invalid flora account' });
@@ -143,6 +214,32 @@ export const buildConsumer = (
     if (!isProofPayload(payload)) {
       logger.warn('[proof] rejected: invalid payload');
       return res.status(400).json({ error: 'Invalid proof payload' });
+    }
+
+    const expectedAccountId = petalAccountsById?.[payload.petalId];
+    if (expectedAccountId && payload.petalAccountId !== expectedAccountId) {
+      logger.warn('[proof] rejected: petal account mismatch', {
+        petalId: payload.petalId,
+        expectedAccountId,
+        petalAccountId: payload.petalAccountId,
+      });
+      return res.status(400).json({ error: 'Invalid petal account' });
+    }
+    if (!hasExpectedParticipants(payload.participants)) {
+      logger.warn('[proof] rejected: participants mismatch');
+      return res.status(400).json({ error: 'Unexpected participants' });
+    }
+    const existingStateTopic = petalStateTopicsById.get(payload.petalId);
+    if (existingStateTopic && payload.petalStateTopicId !== existingStateTopic) {
+      logger.warn('[proof] rejected: petal state topic mismatch', {
+        petalId: payload.petalId,
+        expectedStateTopicId: existingStateTopic,
+        petalStateTopicId: payload.petalStateTopicId,
+      });
+      return res.status(400).json({ error: 'Invalid petal state topic' });
+    }
+    if (!existingStateTopic) {
+      petalStateTopicsById.set(payload.petalId, payload.petalStateTopicId);
     }
 
     logger.info(
@@ -161,17 +258,12 @@ export const buildConsumer = (
       logger.warn('[proof] rejected: registry topic mismatch');
       return res.status(400).json({ error: 'Unexpected registry topic' });
     }
-    if (payload.participants.length !== expectedPetals) {
-      logger.warn('[proof] rejected: participants mismatch');
-      return res.status(400).json({ error: 'Unexpected participants' });
-    }
-
     ingestProof(payload);
     return res.json({ status: 'accepted' });
   });
 
-  serverApp.get('/price/latest', (_req: Request, res: Response) => {
-    const latest = history[history.length - 1];
+  serverApp.get(['/price/latest', '/api/price/latest'], (_req: Request, res: Response) => {
+    const latest = publishConsensus ? getLatestPublishedConsensus() : history[history.length - 1];
     if (!latest) {
       return res.status(404).json({ error: 'No consensus yet' });
     }
@@ -181,7 +273,7 @@ export const buildConsumer = (
     });
   });
 
-  serverApp.get('/price/history', (_req: Request, res: Response) => {
+  serverApp.get(['/price/history', '/api/price/history'], (_req: Request, res: Response) => {
     const ordered = [...history].reverse();
     const limit = Math.max(
       1,
@@ -200,11 +292,11 @@ export const buildConsumer = (
     });
   });
 
-  serverApp.get('/health', (_req: Request, res: Response) => {
+  serverApp.get(['/health', '/api/health'], (_req: Request, res: Response) => {
     res.json({ status: 'ok' });
   });
 
-  serverApp.get('/adapters', async (_req: Request, res: Response) => {
+  serverApp.get(['/adapters', '/api/adapters'], async (_req: Request, res: Response) => {
     const petals = Array.from(petalAdapters.values()).sort((a, b) =>
       a.petalId.localeCompare(b.petalId)
     );
@@ -220,6 +312,29 @@ export const buildConsumer = (
         };
       })
     );
+    const memberEntries = petalAccountsById
+      ? Object.entries(petalAccountsById)
+      : [];
+    const members = await Promise.all(
+      memberEntries.map(async ([petalId, accountId]) => {
+        const key = await fetchAccountKey(accountId);
+        return {
+          petalId,
+          accountId,
+          publicKey: key?.publicKey,
+          keyType: key?.keyType,
+        };
+      })
+    );
+    const resolvedMembers =
+      members.length > 0
+        ? members
+        : petalsWithKeys.map((entry) => ({
+            petalId: entry.petalId,
+            accountId: entry.accountId,
+            publicKey: entry.publicKey,
+            keyType: entry.keyType,
+          }));
     const floraKey = await fetchAccountKey(floraAccountId);
     const aggregateFingerprints: Record<string, string> = {};
     const aggregateAdapters = new Set<string>();
@@ -231,6 +346,7 @@ export const buildConsumer = (
     });
     res.json({
       petals: petalsWithKeys,
+      members: resolvedMembers,
       flora: {
         accountId: floraAccountId,
         publicKey: floraKey?.publicKey,
@@ -259,9 +375,6 @@ export const buildConsumer = (
       },
     });
   });
-
-  let pollTimer: NodeJS.Timeout | null = null;
-  let lastTimestamp = options.initialLastTimestamp ?? '0';
 
   const ingestProof = (proof: ProofPayload | ChunkedProofPayload) => {
     if (isChunkedProofPayload(proof)) {
@@ -304,6 +417,7 @@ export const buildConsumer = (
     petalAdapters.set(enriched.petalId, {
       petalId: enriched.petalId,
       accountId: enriched.petalAccountId,
+      stateTopicId: enriched.petalStateTopicId,
       epoch: enriched.epoch,
       timestamp: enriched.timestamp,
       adapters: adapterIds,
@@ -323,21 +437,20 @@ export const buildConsumer = (
       bucket,
       quorum,
       thresholdFingerprint,
-      expectedPetals
+      participantAccounts,
     );
     if (consensus) {
+      const { entry, proofs } = consensus;
       const exists = history.some(
-        (entry) =>
-          entry.epoch === consensus.epoch &&
-          entry.stateHash === consensus.stateHash
+        (item) => item.epoch === entry.epoch && item.stateHash === entry.stateHash,
       );
       if (!exists) {
-        history.push(consensus);
+        history.push(entry);
         history.sort((a, b) => a.epoch - b.epoch);
         if (options.persistConsensus) {
-          void options.persistConsensus(consensus).catch(() => {
-          });
+          void options.persistConsensus(entry).catch(() => {});
         }
+        scheduleConsensusPublish(entry, proofs);
       }
     }
   };
@@ -373,87 +486,33 @@ export const buildConsumer = (
       };
       history[idx] = updated;
       if (persistConsensus) {
-        void persistConsensus(updated).catch(() => {
-        });
+        void persistConsensus(updated).catch(() => {});
       }
     }
   };
-
-  const pollMirror = async (): Promise<void> => {
-    const url = `${mirrorBaseUrl}/api/v1/topics/${stateTopicId}/messages?order=asc&limit=50${
-      lastTimestamp ? `&timestamp=gt:${lastTimestamp}` : ''
-    }`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      return;
-    }
-    const body = (await response.json()) as {
-      messages: {
-        consensus_timestamp: string;
-        sequence_number: number;
-        message: string;
-      }[];
-    };
-    const messages = body.messages ?? [];
-    for (const entry of messages) {
-      const ts = entry.consensus_timestamp;
-      if (lastTimestamp && ts && ts <= lastTimestamp) {
-        continue;
-      }
-      lastTimestamp = ts;
-      try {
-        const decoded = Buffer.from(entry.message, 'base64').toString('utf8');
-        const payload = JSON.parse(decoded) as unknown;
-
-        const payloadEpoch = getEpochFromPayload(payload);
-        const targetEpoch =
-          payloadEpoch ??
-          (metaQueue.length > 0 ? metaQueue[0] : undefined);
-
-        if (typeof targetEpoch === 'number') {
-          applyMeta(targetEpoch, {
-            consensusTimestamp: ts,
-            sequenceNumber: entry.sequence_number,
-          });
-        }
-
-        if (isProofPayload(payload)) {
-          ingestProof({
-            ...payload,
-            hcsMessage: `hcs://17/${stateTopicId}`,
-            consensusTimestamp: ts,
-            sequenceNumber: entry.sequence_number,
-          });
-        }
-      } catch {
-        logger.warn('[mirror] message parse failed');
-      }
-    }
-  };
-
-  const startPolling = () => {
-    pollTimer = setInterval(() => {
-      void pollMirror();
-    }, pollIntervalMs);
-  };
-
-  const stopPolling = () => {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-  };
-
-  startPolling();
+  const { stop: stopPolling } = createStateTopicPoller({
+    mirrorBaseUrl,
+    stateTopicId,
+    pollIntervalMs,
+    logger,
+    initialLastTimestamp: options.initialLastTimestamp ?? "0",
+    getEpochFromPayload,
+    getFallbackEpoch: () => (metaQueue.length > 0 ? metaQueue[0] : undefined),
+    applyMeta,
+    ingestProof,
+    isProofPayload,
+  });
 
   return {
     app: serverApp,
-    getLatest: () => history[history.length - 1] ?? null,
+    getLatest: () => (publishConsensus ? getLatestPublishedConsensus() : history[history.length - 1]) ?? null,
     waitForConsensus: (timeoutMs: number) =>
       new Promise((resolve) => {
         const start = Date.now();
         const check = () => {
-          const latest = history[history.length - 1];
+          const latest = publishConsensus
+            ? getLatestPublishedConsensus()
+            : history[history.length - 1];
           if (latest) {
             resolve(latest);
             return;

@@ -4,7 +4,7 @@ FROM node:22-alpine
 
 WORKDIR /workspace
 
-RUN apk add --no-cache libc6-compat python3 make g++ && \
+RUN apk add --no-cache libc6-compat && \
   corepack enable && \
   corepack prepare pnpm@10.19.0 --activate
 

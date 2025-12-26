@@ -20,7 +20,33 @@ pool.on("error", (error: unknown) => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const extractPgErrorCode = (error: unknown): string | undefined => {
+  if (!isRecord(error)) return undefined;
+  const value = error.code;
+  return typeof value === "string" ? value : undefined;
+};
+
+const waitForPostgres = async (): Promise<void> => {
+  const maxAttempts = Number(process.env.PG_CONNECT_ATTEMPTS ?? "60");
+  const delayMs = Number(process.env.PG_CONNECT_DELAY_MS ?? "2000");
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      await pool.query("SELECT 1");
+      return;
+    } catch (error: unknown) {
+      const code = extractPgErrorCode(error);
+      logger.warn("Waiting for Postgres", { attempt: attempt + 1, code });
+      await sleep(delayMs);
+    }
+  }
+  throw new Error("Postgres did not become ready in time");
+};
+
 export const initDb = async (): Promise<void> => {
+  await waitForPostgres();
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_state (
       key TEXT PRIMARY KEY,

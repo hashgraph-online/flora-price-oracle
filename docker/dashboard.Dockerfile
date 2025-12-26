@@ -6,13 +6,14 @@ RUN apk add --no-cache libc6-compat
 ENV NEXT_TELEMETRY_DISABLED=1
 
 FROM base AS builder
-RUN apk add --no-cache --virtual .build-deps build-base python3 make g++ bash curl && \
+RUN apk add --no-cache --virtual .build-deps build-base python3 make g++ bash && \
   corepack enable && corepack prepare pnpm@10.19.0 --activate
+ENV CI=1
 COPY dashboard/package.json ./
 RUN pnpm install --no-frozen-lockfile
 COPY dashboard .
 RUN pnpm run build
-RUN pnpm prune --prod && apk del .build-deps
+RUN apk del .build-deps
 
 FROM base AS runner
 RUN apk add --no-cache dumb-init

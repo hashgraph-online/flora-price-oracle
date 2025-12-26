@@ -80,7 +80,7 @@ export default function Footer() {
               </li>
               <li>
                 <a
-                  href="https://github.com/hashgraph-online"
+                  href="https://github.com/hashgraph-online/flora-price-oracle"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[#e0e7ff] hover:text-white transition-colors"

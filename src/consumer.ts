@@ -15,6 +15,9 @@ import {
   publishDeclarations,
 } from './consumer/registry.js';
 import { buildConsumer } from './consumer/server.js';
+import { publishConsensusToStateTopic } from "./consumer/state-topic-publisher.js";
+import { selectRoundLeader, sortAccountIds } from "./consumer/leader.js";
+import { validateProofsOnStateTopics } from "./consumer/state-topic-validation.js";
 import { resolveNetwork } from './lib/network.js';
 import { resolveOperatorKeyType, type HederaKeyType } from './lib/operator-key-type.js';
 
@@ -123,8 +126,41 @@ export const startConsumer = async (
     minHbarBalance: petalMinHbarBalance,
     targetHbarBalance: petalTargetHbarBalance,
   });
+  const petalAccountsById = Object.fromEntries(
+    Object.entries(petalAccounts).map(([petalId, entry]) => [petalId, entry.accountId]),
+  );
   const memberAccounts = Object.values(petalAccounts).map((entry) => entry.accountId);
   const memberPrivateKeys = Object.values(petalAccounts).map((entry) => entry.privateKey);
+  const petalPrivateKeysByAccountId = Object.fromEntries(
+    Object.values(petalAccounts).map((entry) => [entry.accountId, entry.privateKey]),
+  );
+  const orderedMemberAccounts = sortAccountIds(memberAccounts);
+  const petalKeyTypesByAccountId: Record<string, HederaKeyType> = {};
+  await Promise.all(
+    orderedMemberAccounts.map(async (accountId) => {
+      const keyType: HederaKeyType = await resolveOperatorKeyType({
+        mirrorBaseUrl: config.mirrorBaseUrl,
+        accountId,
+      }).catch((error: unknown) => {
+        logger.warn("Failed to detect petal key type; defaulting to ECDSA", {
+          accountId,
+          error,
+        });
+        return "ecdsa" as const;
+      });
+      petalKeyTypesByAccountId[accountId] = keyType;
+    }),
+  );
+  const isAccountId = (value: string): boolean => /^\d+\.\d+\.\d+$/.test(value.trim());
+  const normalizeParticipants = (participants: string[]): string[] => {
+    if (orderedMemberAccounts.length === 0) return participants;
+    const invalid = participants.some((participant) => !isAccountId(participant));
+    return invalid ? orderedMemberAccounts : participants;
+  };
+  const normalizedHistory = persistedHistory.map((entry) => ({
+    ...entry,
+    participants: normalizeParticipants(entry.participants),
+  }));
   const floraThreshold = parseNumber(process.env.FLORA_THRESHOLD, petalIds.length);
 
   const floraNetwork =
@@ -143,6 +179,7 @@ export const startConsumer = async (
           operatorKey,
           operatorKeyType,
           network,
+          mirrorBaseUrl: config.mirrorBaseUrl,
           members: memberAccounts,
           memberPrivateKeys,
           threshold: floraThreshold,
@@ -160,6 +197,7 @@ export const startConsumer = async (
 
   const merged: ConsumerConfig = {
     ...config,
+    petalAccountsById,
     floraAccountId: floraNetwork.floraAccountId,
     adapterCategoryTopicId: registryGraph.categoryTopicId,
     adapterDiscoveryTopicId: registryGraph.discoveryTopicId,
@@ -170,7 +208,7 @@ export const startConsumer = async (
     transactionTopicId: floraNetwork.transactionTopicId,
   };
   const initialLastTimestamp =
-    persistedHistory[persistedHistory.length - 1]?.timestamp ||
+    normalizedHistory[normalizedHistory.length - 1]?.consensusTimestamp ||
     (await fetchLatestMirrorTimestamp(
       merged.stateTopicId,
       merged.mirrorBaseUrl
@@ -180,9 +218,53 @@ export const startConsumer = async (
   const { app, getLatest, waitForConsensus, stopPolling } = buildConsumer(
     merged,
     {
-      initialHistory: persistedHistory,
+      initialHistory: normalizedHistory,
       persistConsensus: saveConsensusEntry,
       initialLastTimestamp,
+      publishConsensus: async (entry, proofs) => {
+        const leaderAccountId = selectRoundLeader(entry.epoch, orderedMemberAccounts);
+        if (!leaderAccountId) {
+          logger.warn("No leader resolved for consensus publish", { epoch: entry.epoch });
+          return null;
+        }
+        const leaderPrivateKey = petalPrivateKeysByAccountId[leaderAccountId];
+        if (!leaderPrivateKey) {
+          logger.warn("Leader private key unavailable for consensus publish", {
+            epoch: entry.epoch,
+            leaderAccountId,
+          });
+          return null;
+        }
+        const leaderKeyType = petalKeyTypesByAccountId[leaderAccountId];
+        const validation = await validateProofsOnStateTopics({
+          mirrorBaseUrl: merged.mirrorBaseUrl,
+          proofs,
+        });
+        if (validation.invalid.length > 0) {
+          logger.warn("Consensus publish blocked by missing petal state topics", {
+            epoch: entry.epoch,
+            leaderAccountId,
+            invalidPetals: validation.invalid.map((proof) => proof.petalId),
+          });
+          return null;
+        }
+        return await publishConsensusToStateTopic({
+          network,
+          publisherAccountId: leaderAccountId,
+          publisherPrivateKey: leaderPrivateKey,
+          publisherKeyType: leaderKeyType,
+          floraAccountId: floraNetwork.floraAccountId,
+          stateTopicId: floraNetwork.stateTopicId,
+          topics: [
+            floraNetwork.coordinationTopicId,
+            floraNetwork.transactionTopicId,
+            registryGraph.categoryTopicId,
+            registryGraph.discoveryTopicId,
+          ],
+          entry,
+          thresholdFingerprint: config.thresholdFingerprint,
+        });
+      },
     }
   );
   const server = app.listen(merged.port, () => {

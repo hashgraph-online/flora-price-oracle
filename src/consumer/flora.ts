@@ -9,12 +9,15 @@ import {
   Client,
   Hbar,
   KeyList,
-  PrivateKey,
+  TopicUpdateTransaction,
   TopicCreateTransaction,
 } from "@hashgraph/sdk";
+import type { PrivateKey } from "@hashgraph/sdk";
 import { getState, setState } from "./persistence.js";
 import { buildHederaClient } from "../lib/hedera-client.js";
 import type { HederaKeyType } from "../lib/operator-key-type.js";
+import { parsePrivateKey } from "../lib/hedera-private-key.js";
+import { fetchWithTimeout } from "../lib/http.js";
 
 export type FloraNetwork = {
   floraAccountId: string;
@@ -24,6 +27,8 @@ export type FloraNetwork = {
 };
 
 const logger = new Logger({ module: "flora-consumer" });
+const submitKeyStateKey = "flora_submit_keys_updated";
+const submitKeyUpdateMemo = "hcs-16:op:1:1";
 
 const normalizeValue = (value?: string | null): string | undefined => {
   if (!value) return undefined;
@@ -36,8 +41,87 @@ const storeStateValue = async (key: string, value?: string): Promise<void> => {
   await setState(key, value);
 };
 
-const parseMemberKeys = (memberPrivateKeys: string[]): PrivateKey[] =>
-  memberPrivateKeys.map((key) => PrivateKey.fromStringECDSA(key));
+const parseMemberKeys = (memberPrivateKeys: string[]) =>
+  memberPrivateKeys.map((key) => parsePrivateKey(key));
+
+const normalizeMirrorBaseUrl = (value: string): string => {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed.endsWith("/api/v1") ? trimmed.slice(0, -"/api/v1".length) : trimmed;
+};
+
+const readVarint = (
+  bytes: Uint8Array,
+  startOffset: number,
+): { value: number; offset: number } | null => {
+  let result = 0;
+  let shift = 0;
+  let offset = startOffset;
+  for (let idx = 0; idx < 10 && offset < bytes.length; idx += 1) {
+    const byte = bytes[offset];
+    if (byte === undefined) return null;
+    result |= (byte & 0x7f) << shift;
+    offset += 1;
+    if ((byte & 0x80) === 0) {
+      return { value: result, offset };
+    }
+    shift += 7;
+  }
+  return null;
+};
+
+const hexToBytes = (hex: string): Uint8Array | null => {
+  const trimmed = hex.trim();
+  if (!/^[0-9a-fA-F]+$/.test(trimmed)) return null;
+  if (trimmed.length % 2 !== 0) return null;
+  const out = new Uint8Array(trimmed.length / 2);
+  for (let idx = 0; idx < out.length; idx += 1) {
+    const value = Number.parseInt(trimmed.slice(idx * 2, idx * 2 + 2), 16);
+    if (!Number.isFinite(value)) return null;
+    out[idx] = value;
+  }
+  return out;
+};
+
+const decodeThresholdFromProtobufKey = (hexKey: string): number | null => {
+  const bytes = hexToBytes(hexKey);
+  if (!bytes || bytes.length < 3) return null;
+
+  const tag = readVarint(bytes, 0);
+  if (!tag || tag.value !== 0x2a) return null;
+
+  const length = readVarint(bytes, tag.offset);
+  if (!length) return null;
+  if (length.value <= 0) return null;
+
+  const start = length.offset;
+  const end = start + length.value;
+  if (end > bytes.length) return null;
+
+  const inner = bytes.slice(start, end);
+  const innerTag = readVarint(inner, 0);
+  if (!innerTag || innerTag.value !== 0x08) return null;
+  const threshold = readVarint(inner, innerTag.offset);
+  if (!threshold) return null;
+  return threshold.value;
+};
+
+type MirrorTopicInfo = {
+  submit_key?: { _type?: string; key?: string };
+};
+
+const fetchTopicSubmitThreshold = async (params: {
+  mirrorBaseUrl: string;
+  topicId: string;
+}): Promise<number | null> => {
+  const base = normalizeMirrorBaseUrl(params.mirrorBaseUrl);
+  const url = `${base}/api/v1/topics/${params.topicId}`;
+  const response = await fetchWithTimeout(url, {}, 5000);
+  if (!response.ok) return null;
+  const body = (await response.json()) as MirrorTopicInfo;
+  const encoded = body.submit_key?.key;
+  if (!encoded) return null;
+  return decodeThresholdFromProtobufKey(encoded);
+};
 
 const signAndExecuteTopicCreate = async (params: {
   client: Client;
@@ -57,6 +141,71 @@ const signAndExecuteTopicCreate = async (params: {
   return receipt.topicId.toString();
 };
 
+const updateTopicSubmitKey = async (params: {
+  client: Client;
+  topicId: string;
+  submitKey: KeyList;
+  memberKeys: PrivateKey[];
+}): Promise<void> => {
+  const tx = new TopicUpdateTransaction()
+    .setTopicId(params.topicId)
+    .setSubmitKey(params.submitKey)
+    .setTransactionMemo(submitKeyUpdateMemo);
+
+  const frozen = await tx.freezeWith(params.client);
+  let signed = frozen;
+  for (const key of params.memberKeys) {
+    signed = await signed.sign(key);
+  }
+  const resp = await signed.execute(params.client);
+  await resp.getReceipt(params.client);
+};
+
+const ensureSubmitKeysUpdated = async (params: {
+  client: Client;
+  topicIds: string[];
+  submitKey: KeyList;
+  memberKeys: PrivateKey[];
+  mirrorBaseUrl: string;
+}): Promise<void> => {
+  const stored = normalizeValue(await getState(submitKeyStateKey));
+  const topicThresholds = await Promise.all(
+    params.topicIds.map(async (topicId) => {
+      const threshold = await fetchTopicSubmitThreshold({
+        mirrorBaseUrl: params.mirrorBaseUrl,
+        topicId,
+      }).catch(() => null);
+      return { topicId, threshold };
+    }),
+  );
+
+  const needsUpdate = topicThresholds
+    .filter((entry) => typeof entry.threshold === "number" && entry.threshold !== 1)
+    .map((entry) => entry.topicId);
+
+  if (needsUpdate.length === 0) {
+    if (stored !== "true") {
+      await setState(submitKeyStateKey, "true");
+    }
+    return;
+  }
+
+  try {
+    for (const topicId of needsUpdate) {
+      await updateTopicSubmitKey({
+        client: params.client,
+        topicId,
+        submitKey: params.submitKey,
+        memberKeys: params.memberKeys,
+      });
+      logger.info("Updated flora topic submit key", { topicId });
+    }
+    await setState(submitKeyStateKey, "true");
+  } catch (error) {
+    logger.warn("Failed to update flora submit keys", { error });
+  }
+};
+
 const waitForKeyLists = async (
   client: HCS16Client,
   members: string[],
@@ -66,7 +215,7 @@ const waitForKeyLists = async (
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const adminKey = await client.assembleKeyList({ members, threshold });
-      const submitKey = await client.assembleSubmitKeyList(members);
+      const submitKey = await client.assembleKeyList({ members, threshold: 1 });
       return { adminKey, submitKey };
     } catch (error) {
       logger.warn("Waiting for petal keys to appear on mirror node", {
@@ -90,7 +239,7 @@ const createFloraWithRetry = async (
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const keyList = await client.assembleKeyList({ members, threshold });
-      const submitList = await client.assembleSubmitKeyList(members);
+      const submitList = await client.assembleKeyList({ members, threshold: 1 });
 
       const createAcc = await new AccountCreateTransaction()
         .setKey(keyList)
@@ -108,6 +257,7 @@ const createFloraWithRetry = async (
         keyList,
         submitList,
       });
+      txs.state.setSubmitKey(submitList);
 
       const communication = await signAndExecuteTopicCreate({
         client: hederaClient,
@@ -144,6 +294,7 @@ export const resolveFloraNetwork = async (params: {
   operatorKey: string;
   operatorKeyType?: HederaKeyType;
   network: NetworkType;
+  mirrorBaseUrl: string;
   members: string[];
   memberPrivateKeys: string[];
   threshold: number;
@@ -173,18 +324,9 @@ export const resolveFloraNetwork = async (params: {
   const resolvedState = stateTopicEnv ?? storedStateTopic;
   const resolvedCoordination = coordinationTopicEnv ?? storedCoordination;
   const resolvedTransaction = transactionTopicEnv ?? storedTransaction;
-
-  if (floraAccountId && resolvedState && resolvedCoordination && resolvedTransaction) {
-    await storeStateValue("state_topic_id", stateTopicEnv);
-    await storeStateValue("coordination_topic_id", coordinationTopicEnv);
-    await storeStateValue("transaction_topic_id", transactionTopicEnv);
-    return {
-      floraAccountId,
-      stateTopicId: resolvedState,
-      coordinationTopicId: resolvedCoordination,
-      transactionTopicId: resolvedTransaction,
-    };
-  }
+  await storeStateValue("state_topic_id", stateTopicEnv);
+  await storeStateValue("coordination_topic_id", coordinationTopicEnv);
+  await storeStateValue("transaction_topic_id", transactionTopicEnv);
 
   const floraClient = new HCS16Client({
     network: params.network,
@@ -212,6 +354,16 @@ export const resolveFloraNetwork = async (params: {
     await setState("state_topic_id", created.stateTopicId);
     await setState("coordination_topic_id", created.coordinationTopicId);
     await setState("transaction_topic_id", created.transactionTopicId);
+    await setState(submitKeyStateKey, "false");
+
+    const { submitKey } = await waitForKeyLists(floraClient, params.members, threshold);
+    await ensureSubmitKeysUpdated({
+      client: hederaClient,
+      topicIds: [created.stateTopicId, created.coordinationTopicId, created.transactionTopicId],
+      submitKey,
+      memberKeys,
+      mirrorBaseUrl: params.mirrorBaseUrl,
+    });
     return created;
   }
 
@@ -239,6 +391,7 @@ export const resolveFloraNetwork = async (params: {
         break;
       case FloraTopicType.STATE:
         tx = txs.state;
+        tx.setSubmitKey(submitKey);
         break;
       default:
         throw new Error("Unsupported Flora topic type");
@@ -255,6 +408,14 @@ export const resolveFloraNetwork = async (params: {
     resolvedCoordination ?? (await createTopic(FloraTopicType.COMMUNICATION));
   const transactionTopicId =
     resolvedTransaction ?? (await createTopic(FloraTopicType.TRANSACTION));
+
+  await ensureSubmitKeysUpdated({
+    client: hederaClient,
+    topicIds: [stateTopicId, coordinationTopicId, transactionTopicId],
+    submitKey,
+    memberKeys,
+    mirrorBaseUrl: params.mirrorBaseUrl,
+  });
 
   await setState("state_topic_id", stateTopicId);
   await setState("coordination_topic_id", coordinationTopicId);

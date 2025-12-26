@@ -45,6 +45,7 @@ export const isProofPayload = (value: unknown): value is ProofPayload => {
     isString(value.thresholdFingerprint) &&
     isString(value.petalId) &&
     isString(value.petalAccountId) &&
+    isString(value.petalStateTopicId) &&
     isString(value.floraAccountId) &&
     isStringArray(value.participants) &&
     Array.isArray(value.records) &&

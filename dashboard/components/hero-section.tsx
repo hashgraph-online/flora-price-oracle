@@ -11,7 +11,19 @@ type HeroMetrics = {
   adapters: number;
 };
 
-export const HeroSection: React.FC<{ metrics: HeroMetrics }> = ({ metrics }) => {
+type HeroSectionProps = {
+  metrics: HeroMetrics;
+  networkLabel?: string;
+};
+
+const formatNetworkLabel = (value?: string): string => {
+  const trimmed = value?.trim();
+  if (!trimmed) return 'Testnet';
+  return `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
+};
+
+export const HeroSection: React.FC<HeroSectionProps> = ({ metrics, networkLabel }) => {
+  const network = formatNetworkLabel(networkLabel);
   return (
     <section className="relative min-h-[500px] flex items-center justify-center overflow-hidden py-20">
       <AnimatedBackground />
@@ -44,7 +56,7 @@ export const HeroSection: React.FC<{ metrics: HeroMetrics }> = ({ metrics }) => 
               </Button>
               <Button
                 variant="outline"
-                onClick={() => window.open('https://github.com/hashgraph-online/flora-example', '_blank')}
+                onClick={() => window.open('https://github.com/hashgraph-online/flora-price-oracle', '_blank')}
                 className="px-8 py-6 text-lg font-medium"
               >
                 Documentation
@@ -63,7 +75,7 @@ export const HeroSection: React.FC<{ metrics: HeroMetrics }> = ({ metrics }) => 
                   </div>
                   <div>
                     <Typography variant="h4">System Status</Typography>
-                    <Typography variant="caption" color="muted">Flora Mainnet</Typography>
+                    <Typography variant="caption" color="muted">Flora {network}</Typography>
                   </div>
                 </div>
                 <StatusBadge status="OPERATIONAL" variant="success" pulse />

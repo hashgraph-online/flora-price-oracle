@@ -7,6 +7,7 @@ export type ProofPayload = {
   thresholdFingerprint: string;
   petalId: string;
   petalAccountId: string;
+  petalStateTopicId: string;
   floraAccountId: string;
   participants: string[];
   records: AdapterRecord[];
@@ -35,6 +36,7 @@ export type ConsumerConfig = {
   expectedPetals: number;
   port: number;
   thresholdFingerprint: string;
+  petalAccountsById?: Record<string, string>;
   floraAccountId: string;
   stateTopicId: string;
   coordinationTopicId: string;
@@ -56,6 +58,7 @@ export type PetalAdapterState = {
   accountId?: string;
   publicKey?: string;
   keyType?: string;
+  stateTopicId?: string;
   epoch: number;
   timestamp: string;
   adapters: string[];

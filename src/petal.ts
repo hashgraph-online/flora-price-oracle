@@ -16,6 +16,7 @@ import { canonicalize } from "./lib/canonicalize.js";
 import { sha384 } from "./lib/hash.js";
 import { getState, getSecureState, initDb, setState } from "./lib/db.js";
 import { resolveNetwork } from "./lib/network.js";
+import { resolveOperatorKeyType, type HederaKeyType } from "./lib/operator-key-type.js";
 
 dotenv.config();
 
@@ -26,12 +27,15 @@ type PetalConfig = {
   petalId: string;
   accountId: string;
   privateKey: string;
+  keyType: HederaKeyType;
   floraAccountId: string;
   participants: string[];
   floraThresholdFingerprint: string;
   blockTimeMs: number;
   epochOriginMs: number;
-  stateTopicId: TopicId;
+  publishStateTopic: boolean;
+  petalStateTopicId: TopicId;
+  floraStateTopicId: TopicId;
   coordinationTopicId: TopicId;
   transactionTopicId: TopicId;
   registryTopicId: string;
@@ -62,6 +66,16 @@ const parseNumber = (value: string | undefined, fallback: number): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const parseBoolean = (value: string | undefined, fallback: boolean): boolean => {
+  const trimmed = value?.trim().toLowerCase();
+  if (!trimmed) return fallback;
+  if (trimmed === "true" || trimmed === "1" || trimmed === "yes") return true;
+  if (trimmed === "false" || trimmed === "0" || trimmed === "no") return false;
+  return fallback;
+};
+
+const isAccountId = (value: string): boolean => /^\d+\.\d+\.\d+$/.test(value.trim());
+
 const resolveRegistryTopicId = async (params: RegistryResolutionParams): Promise<string> => {
   const direct =
     normalizePointer(params.provided) ??
@@ -79,10 +93,49 @@ const resolveRegistryTopicId = async (params: RegistryResolutionParams): Promise
   throw new Error("Adapter category topic not found. Ensure consumer has bootstrapped the registry.");
 };
 
+const resolvePetalStateTopicId = async (params: {
+  petalId: string;
+  accountId: string;
+  privateKey: string;
+  keyType: HederaKeyType;
+  mirrorBaseUrl: string;
+  network: NetworkType;
+  override?: TopicId;
+}): Promise<TopicId> => {
+  const overrideValue = params.override?.toString();
+  const stateKey = `petal_state_topic_${params.petalId}`;
+  if (overrideValue && overrideValue !== "0.0.0") {
+    await setState(stateKey, overrideValue);
+    return TopicId.fromString(overrideValue);
+  }
+
+  const envValue = normalizePointer(process.env.PETAL_STATE_TOPIC_ID);
+  if (envValue) {
+    await setState(stateKey, envValue);
+    return TopicId.fromString(envValue);
+  }
+
+  const stored = normalizePointer(await getState(stateKey));
+  if (stored) {
+    return TopicId.fromString(stored);
+  }
+
+  const client = new HCS17Client({
+    network: params.network,
+    operatorId: params.accountId,
+    operatorKey: params.privateKey,
+    keyType: params.keyType,
+    mirrorNodeUrl: params.mirrorBaseUrl,
+  });
+  const topicId = await client.createStateTopic({ adminKey: true, submitKey: true });
+  await setState(stateKey, topicId);
+  return TopicId.fromString(topicId);
+};
+
 const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> => {
   const resolvedPetalId = override?.petalId ?? process.env.PETAL_ID ?? "petal-unknown";
   const logger = createPetalLogger(resolvedPetalId);
-  const participants = (process.env.FLORA_PARTICIPANTS ?? "")
+  const participantEntries = (process.env.FLORA_PARTICIPANTS ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
@@ -93,12 +146,15 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
     petalId: resolvedPetalId,
     accountId: "",
     privateKey: "",
+    keyType: "ecdsa",
     floraAccountId: "",
-    participants,
+    participants: participantEntries,
     floraThresholdFingerprint: process.env.FLORA_THRESHOLD_FINGERPRINT ?? "demo-threshold",
     blockTimeMs: parseNumber(process.env.BLOCK_TIME_MS, 2000),
     epochOriginMs,
-    stateTopicId: TopicId.fromString("0.0.0"),
+    publishStateTopic: parseBoolean(process.env.PETAL_PUBLISH_STATE_TOPIC, true),
+    petalStateTopicId: TopicId.fromString("0.0.0"),
+    floraStateTopicId: TopicId.fromString("0.0.0"),
     coordinationTopicId: TopicId.fromString("0.0.0"),
     transactionTopicId: TopicId.fromString("0.0.0"),
     registryTopicId: "",
@@ -122,8 +178,8 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
       return { accountId: overrideAccount, privateKey: overrideKey };
     }
 
-    const envAccount = normalizePointer(process.env.PETAL_ACCOUNT_ID ?? process.env.HEDERA_ACCOUNT_ID);
-    const envKey = normalizePointer(process.env.PETAL_PRIVATE_KEY ?? process.env.HEDERA_PRIVATE_KEY);
+    const envAccount = normalizePointer(process.env.PETAL_ACCOUNT_ID);
+    const envKey = normalizePointer(process.env.PETAL_PRIVATE_KEY);
     if (envAccount && envKey) {
       logger.info(`Using petal account from env: ${envAccount}`);
       return { accountId: envAccount, privateKey: envKey };
@@ -131,7 +187,7 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
 
     const accountKey = `petal_account_${resolvedPetalId}`;
     const privateKeyKey = `petal_private_key_${resolvedPetalId}`;
-    for (let i = 0; i < 30; i += 1) {
+    for (let i = 0; i < 180; i += 1) {
       const storedAccount = await getState(accountKey);
       const storedPrivateKey = await getSecureState(privateKeyKey);
       if (storedAccount && storedPrivateKey) {
@@ -144,6 +200,13 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
   };
 
   const { accountId, privateKey } = await waitForAccount();
+  const keyType: HederaKeyType = await resolveOperatorKeyType({
+    mirrorBaseUrl: merged.mirrorBaseUrl,
+    accountId,
+  }).catch((error: unknown) => {
+    logger.warn("Failed to detect petal key type; defaulting to ECDSA", error);
+    return "ecdsa" as const;
+  });
   const registryTopicId = await resolveRegistryTopicId({
     provided: merged.registryTopicId,
   });
@@ -154,7 +217,7 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
       logger.info(`Using ${key} from env: ${trimmed}`);
       return trimmed;
     }
-    for (let i = 0; i < 30; i += 1) {
+    for (let i = 0; i < 180; i += 1) {
       const value = normalizePointer(await getState(key));
       if (value) {
         logger.info(`Loaded ${key} from db: ${value}`);
@@ -165,12 +228,22 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
     throw new Error(`${key} is required for Hedera publication`);
   };
 
+  const resolveParticipantAccount = async (entry: string): Promise<string> => {
+    if (isAccountId(entry)) return entry;
+    if (entry === resolvedPetalId) return accountId;
+    return await waitForValue(`petal_account_${entry}`);
+  };
+
+  const participants = await Promise.all(
+    participantEntries.map((entry) => resolveParticipantAccount(entry)),
+  );
+
   const floraAccountId =
     normalizePointer(merged.floraAccountId) ??
     (await waitForValue("flora_account_id", process.env.FLORA_ACCOUNT_ID));
 
-  const stateTopicId =
-    override?.stateTopicId ??
+  const floraStateTopicId =
+    override?.floraStateTopicId ??
     TopicId.fromString(await waitForValue("state_topic_id", process.env.STATE_TOPIC_ID));
   const coordinationTopicId =
     override?.coordinationTopicId ??
@@ -178,16 +251,28 @@ const resolveConfig = async (override?: PetalOverrides): Promise<PetalConfig> =>
   const transactionTopicId =
     override?.transactionTopicId ??
     TopicId.fromString(await waitForValue("transaction_topic_id", process.env.TTOPIC_ID));
+  const petalStateTopicId = await resolvePetalStateTopicId({
+    petalId: resolvedPetalId,
+    accountId,
+    privateKey,
+    keyType,
+    mirrorBaseUrl: merged.mirrorBaseUrl,
+    network: merged.network,
+    override: override?.petalStateTopicId,
+  });
 
   return {
     ...merged,
     registryTopicId,
-    stateTopicId,
+    petalStateTopicId,
+    floraStateTopicId,
     coordinationTopicId,
     transactionTopicId,
     accountId,
     privateKey,
+    keyType,
     floraAccountId,
+    participants,
   };
 };
 
@@ -197,6 +282,7 @@ type ProofPayload = {
   thresholdFingerprint: string;
   petalId: string;
   petalAccountId: string;
+  petalStateTopicId: string;
   floraAccountId: string;
   participants: string[];
   records: AdapterRecord[];
@@ -239,6 +325,7 @@ const buildProof = (
     thresholdFingerprint: config.floraThresholdFingerprint,
     petalId: config.petalId,
     petalAccountId: config.accountId,
+    petalStateTopicId: config.petalStateTopicId.toString(),
     floraAccountId: config.floraAccountId,
     participants: config.participants,
     records: normalizedRecords,
@@ -254,6 +341,7 @@ const fetchRegistry = async (config: PetalConfig): Promise<Hcs21RegistryEntry[]>
     network: config.network,
     operatorId: config.accountId,
     operatorKey: config.privateKey,
+    keyType: config.keyType,
     mirrorNodeUrl: config.mirrorBaseUrl,
   });
 
@@ -321,26 +409,29 @@ const runEpoch = async (
   }
 
   const proof = buildProof(records, epoch, config, adapterFingerprints);
-  const hcs17Client = new HCS17Client({
-    network: config.network,
-    operatorId: config.accountId,
-    operatorKey: config.privateKey,
-    mirrorNodeUrl: config.mirrorBaseUrl,
-  });
+  if (config.publishStateTopic) {
+    const hcs17Client = new HCS17Client({
+      network: config.network,
+      operatorId: config.accountId,
+      operatorKey: config.privateKey,
+      keyType: config.keyType,
+      mirrorNodeUrl: config.mirrorBaseUrl,
+    });
 
-  await hcs17Client.submitMessage(config.stateTopicId.toString(), {
-    p: "hcs-17",
-    op: "state_hash",
-    state_hash: proof.stateHash,
-    topics: [
-      config.stateTopicId.toString(),
-      config.coordinationTopicId.toString(),
-      config.transactionTopicId.toString(),
-      config.registryTopicId,
-    ],
-    account_id: config.floraAccountId,
-    m: `hcs17:${epoch}`,
-  });
+    await hcs17Client.submitMessage(config.petalStateTopicId.toString(), {
+      p: "hcs-17",
+      op: "state_hash",
+      state_hash: proof.stateHash,
+      topics: [
+        config.petalStateTopicId.toString(),
+        config.coordinationTopicId.toString(),
+        config.transactionTopicId.toString(),
+        config.registryTopicId,
+      ],
+      account_id: config.accountId,
+      m: `hcs17:${epoch}`,
+    });
+  }
 
   return proof;
 };

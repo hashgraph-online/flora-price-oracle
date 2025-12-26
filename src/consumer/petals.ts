@@ -117,12 +117,13 @@ export const provisionPetalAccounts = async (
       accountMemo: `flora-petal-${petalId}`,
     });
 
+    const privateKey = base.privateKey.toString();
     await setState(accountKey, petal.accountId);
-    await setSecureState(privKeyKey, base.privateKey.toStringRaw());
+    await setSecureState(privKeyKey, privateKey);
 
     const hcs11 = new HCS11Client({
       network,
-      auth: { operatorId: petal.accountId, privateKey: base.privateKey.toStringRaw() },
+      auth: { operatorId: petal.accountId, privateKey },
     });
 
     const profile: HCS11Profile = {
@@ -153,7 +154,7 @@ export const provisionPetalAccounts = async (
       }
     })();
 
-    results[petalId] = { accountId: petal.accountId, privateKey: base.privateKey.toStringRaw() };
+    results[petalId] = { accountId: petal.accountId, privateKey };
 
     if (hederaClient && funding) {
       await ensurePetalFunding({
